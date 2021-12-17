@@ -1,19 +1,5 @@
 #include <Arduino.h>
-/*#include <WiFi.h>
-#include <Wire.h>
-#include <Adafruit_SSD1306.h>
-#include <Adafruit_I2CDevice.h>*/
 #include <driver/i2s.h>
-
-/*//OLED pins
-#define OLED_SDA 21
-#define OLED_SCL 22 
-#define SCREEN_WIDTH 128 // OLED display width, in pixels
-#define SCREEN_HEIGHT 32 // OLED display height, in pixels
-#define SCREEN_ADDRESS 0x3C ///< See datasheet for Address; 0x3D for 128x64, 0x3C for 128x32
-Adafruit_SSD1306 oledDisplay(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);*/
-
-
 
 const i2s_port_t I2S_PORT = I2S_NUM_0;
 const int BLOCK_SIZE = 32;
@@ -21,23 +7,10 @@ const int BLOCK_SIZE = 32;
 void setup()
 {
     Serial.begin(115200);
-
-    /*//initialize OLED
-    if(!oledDisplay.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS)) {
-        Serial.println("SSD1306 nicht gefunden");
-        for(;;);
-    }
-
-    oledDisplay.clearDisplay();  // Display(puffer) löschen
-    oledDisplay.setTextSize(1);  // kleine Schriftgröße (Höhe 8px)
-    oledDisplay.setTextColor(WHITE);  // helle Schrift, dunkler Grund)
-    oledDisplay.setCursor(0, 0);  // links oben anfangen
-    oledDisplay.println("SSD1306 allocated.");
-    oledDisplay.display();*/
-
     Serial.println("Configuring I2S...");
     esp_err_t err;
 
+    // code from https://github.com/maspetsberger/esp32-i2s-mems/blob/master/examples/VUMeterDemo/VUMeterDemo.ino
     // The I2S config as per the example
     const i2s_config_t i2s_config = {
         .mode = i2s_mode_t(I2S_MODE_MASTER | I2S_MODE_RX), // Receive, not transfer
@@ -77,15 +50,10 @@ void setup()
     Serial.println("I2S driver installed.");
 }
 
-bool outputted = false;
-
 void loop()
 {
-    // Read multiple samples at once and calculate the sound pressure
     int32_t samples[BLOCK_SIZE];
-
     size_t num_bytes_read;
-
     esp_err_t err = i2s_read(I2S_PORT, 
                             (char *)samples, 
                             BLOCK_SIZE,     // the doc says bytes, but its elements.
@@ -104,40 +72,4 @@ void loop()
             Serial.print(", ");
     }
     Serial.println();
-    
-
-    /*int samples_read = num_bytes_read / 8;
-    if (samples_read > 0) {
-
-        float mean = 0;
-        for (int i = 0; i < samples_read; ++i) {
-            mean += (samples[i] >> 14);
-        }
-        mean /= samples_read;
-
-        float maxsample = -1e8, minsample = 1e8;
-        for (int i = 0; i < samples_read; ++i) {
-            minsample = min(minsample, samples[i] - mean);
-            maxsample = max(maxsample, samples[i] - mean);
-        }
-        Serial.println(maxsample - minsample);
-    }*/
-
-    // Read multiple samples at once and calculate the sound pressure
-    /*int32_t samples[BLOCK_SIZE];
-    int num_bytes_read = i2s_read_bytes(I2S_PORT, (char *)samples, 
-                                        BLOCK_SIZE,     // the doc says bytes, but its elements.
-                                        portMAX_DELAY); // no timeout
-    
-    int samples_read = num_bytes_read / 8;
-    if (samples_read > 0) {
-
-        float mean = 0;
-        for (int i = 0; i < samples_read; ++i) {
-            mean += samples[i];
-        }
-        Serial.println(mean);
-    }*/
-
-    //delay(300);
 }
