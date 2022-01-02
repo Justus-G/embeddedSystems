@@ -3,11 +3,35 @@
 #include <SPI.h>
 #include <Wire.h>
 #include <Adafruit_I2CDevice.h>
+#include <Adafruit_SSD1306.h>
 #include <driver/i2s.h>
 #include "driver/i2s.h"
 const i2s_port_t I2S_PORT = I2S_NUM_0;
 
+void myAudioMethod (void * pvParameters);
+void myLEDMethod (void * pvParameters);
+
+long last_sample = -1;
+
+//OLED pins
+#define OLED_SDA 21
+#define OLED_SCL 22 
+#define SCREEN_WIDTH 128 // OLED display width, in pixels
+#define SCREEN_HEIGHT 32 // OLED display height, in pixels
+#define SCREEN_ADDRESS 0x3C ///< See datasheet for Address; 0x3D for 128x64, 0x3C for 128x32
+Adafruit_SSD1306 oledDisplay(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+
 void setup() {
+    // OLED stuff
+    if(!oledDisplay.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS)) {
+        Serial.println("SSD1306 nicht gefunden");
+        for(;;);
+    }
+    oledDisplay.clearDisplay();  // Display(puffer) löschen
+    oledDisplay.setTextSize(1);  // kleine Schriftgröße (Höhe 8px)
+    oledDisplay.setTextColor(WHITE);  // helle Schrift, dunkler Grund)
+
+    // I2S Audio init stuff
     Serial.begin(115200);
     esp_err_t err;
 
@@ -40,15 +64,74 @@ void setup() {
         Serial.printf("Failed setting pin: %d\n", err);
         while (true);
     }
+
+    // Multicore stuff
+    TaskHandle_t Task1;
+    TaskHandle_t Task2;
+    pinMode(25, OUTPUT);
+
+    xTaskCreatePinnedToCore(
+        myAudioMethod,
+        "Task1",     /* name of task. */
+        10000,       /* Stack size of task */
+        NULL,        /* parameter of the task */
+        10,           /* priority of the task */
+        &Task1,      /* Task handle to keep track of created task */
+        0            /* pin task to core 0 */
+    );
+    delay(500); 
+
+    xTaskCreatePinnedToCore(
+        myLEDMethod,
+        "Task2",     /* name of task. */
+        10000,       /* Stack size of task */
+        NULL,        /* parameter of the task */
+        10,           /* priority of the task */
+        &Task2,      /* Task handle to keep track of created task */
+        1            /* pin task to core 1 */
+    );
+    delay(500);
+}
+
+void myAudioMethod( void * pvParameters ){
+    /*Serial.print("Task1 running on core ");
+    Serial.println(xPortGetCoreID());*/
+
+    while(true) {
+        // Read a single sample and log it for the Serial Plotter.
+        int32_t sample = 0;
+        int bytes_read = i2s_pop_sample(I2S_PORT, (char *)&sample, portMAX_DELAY); // no timeout
+        if (bytes_read > 0) {
+            Serial.println(sample);
+            last_sample = sample;
+        } else {
+            Serial.println("no samples read.");
+        }
+        vTaskDelay(1);
+    }
+}
+
+void myLEDMethod( void * pvParameters ){
+    /*Serial.print("Task2 running on core ");
+    Serial.println(xPortGetCoreID());*/
+
+    bool switcher = true;
+    while(true) {
+        oledDisplay.clearDisplay();  // Display(puffer) löschen
+        oledDisplay.setCursor(0, 0);  // links oben anfangen
+        oledDisplay.println(last_sample);
+        oledDisplay.display();
+
+        /*if(switcher)
+            digitalWrite(25, HIGH);
+        else
+            digitalWrite(25, LOW);
+        switcher = !switcher;
+        delay(700);*/
+        vTaskDelay(1);
+    }
 }
 
 void loop() {
-    // Read a single sample and log it for the Serial Plotter.
-    int32_t sample = 0;
-    int bytes_read = i2s_pop_sample(I2S_PORT, (char *)&sample, portMAX_DELAY); // no timeout
-    if (bytes_read > 0) {
-        Serial.println(sample);
-    } else {
-        Serial.println("no samples read.");
-    }
+    vTaskDelete(NULL);
 }
