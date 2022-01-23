@@ -471,11 +471,28 @@ double arduinoFFT::MajorPeakParabola()
 		// Peak is at the middle of the parabola
 		double x = -b/(2*a);
 
+		Serial.print("x: ");
+		Serial.print(x);
+		Serial.print(", indexOfMaxY: ");
+		Serial.print(IndexOfMaxY);
+
+
 		// And magnitude is at the extrema of the parabola if you want It...
 		// double y = a*x*x+b*x+c;  
 
 		// Convert to frequency
 		freq = (x  * this->_samplingFrequency) / (this->_samples);
+
+		Serial.print(", freq: ");
+		Serial.print(freq);
+
+		Serial.print(", samplingFrequency: ");
+		Serial.print(this->_samplingFrequency);
+
+		Serial.print(", maxY: ");
+		Serial.print(maxY);
+
+		Serial.println();
 	}
 
 	return freq;
