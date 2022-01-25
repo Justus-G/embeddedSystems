@@ -7,9 +7,10 @@
 #include <driver/i2s.h>
 #include "driver/i2s.h"
 #include <arduinoFFT.h>
+#include "FS.h"
+#include "SD.h"
+#include "SPI.h"
 
-
-unsigned long start_time;
 
 // I2S stuff
 QueueHandle_t pI2S_Queue_;                  // i2s event queue
@@ -29,7 +30,23 @@ const int fft_frequency_bin_count = 16;     // indices:                    0    
 const int16_t fft_frequency_bins[fft_frequency_bin_count]              = {100,  140,  196,  274,  384,  538,  753,  1054,  1476,  2066,  2893,  4050,  5669,  7937,  11112,  15557}; // Hz
 const int16_t fft_frequency_bin_lower_indices[fft_frequency_bin_count] = {0,    1,    2,    3,    4,    5,    8,    11,    15,    21,    29,    40,    56,    79,    111,    155};
 const int16_t fft_frequency_bin_upper_indices[fft_frequency_bin_count] = {  1,    2,    3,    4,    5,    8,   11,    15,    21,    29,    40,    56,    79,   111,    155,    256};
-const float_t fft_frequency_bin_multiplier[fft_frequency_bin_count] =    {0.001,0.005, 0.3, 0.5,  0.7,  0.9,  1.0,   1.0,   1.0,   1.0,   1.0,   1.0,   1.0,   1.0,    1.0,    1.0};
+const float_t fft_frequency_bin_multiplier[fft_frequency_bin_count] =   {0.0001,0.00025,0.1,0.3,  0.5,  0.6,  0.7,   0.8,   0.9,   1.3,   1.4,   1.5,   1.5,   1.5,    1.5,    1.5};
+                                                                    //    0.0001,0.00025
+
+// RTA stuff
+const int rta_max_bar_height = 32;          // bar height of each RTA bar in px
+const int rta_normalization_store_size = 100;// count of last max values to be stored, only applicable for rta_gain_adaptation = RTA_ADAPTIVE_AVG_GAIN
+double rta_normalization_max_values[rta_normalization_store_size] = {};
+int rta_normalization_max_value_index = 0;
+#define RTA_CONSTANT_GAIN 0x00              // use constant max value for constant RTA gain
+#define RTA_ADAPTIVE_GAIN 0x01              // use current max value for adaptive RTA gain with fastest response
+#define RTA_ADAPTIVE_AVG_GAIN 0x02          // use average max value for adaptive RTA gain with slower response -> better readable RTA
+const int rta_gain_adaptation = RTA_ADAPTIVE_AVG_GAIN;
+const double rta_constant_gain_value = 350000000.0; // RTA gain, only applicable for rta_gain_adaptation = RTA_CONSTANT_GAIN, e.g. 350000000.0
+
+// File output stuff
+bool csv_file_output_active = false;   // enable/disable CSV file output
+File csv_file;                              // CSV file for outputting
 
 // parallelization stuff
 bool i2s_read_done = false;                 // core synchronization
@@ -56,6 +73,7 @@ void setup() {
     oledDisplay.clearDisplay();
     oledDisplay.setTextSize(1);         // small font size (height 8px)
     oledDisplay.setTextColor(WHITE);
+    oledDisplay.setCursor(0, 0);
     oledDisplay.println("initializing...");
     oledDisplay.display();
 
@@ -72,10 +90,10 @@ void setup() {
     };
 
     const i2s_pin_config_t pin_config = {
-        .bck_io_num = 14,   // Serial Clock (SCK)
-        .ws_io_num = 13,    // Word Select (WS)
+        .bck_io_num = 23,   // Serial Clock (BCK, green cable,  works: 14)
+        .ws_io_num = 25,    // Word Select (SEL, blue cable,    works: 13)
         .data_out_num = I2S_PIN_NO_CHANGE, // not used (only for speakers)
-        .data_in_num = 12   // Serial Data (SD)
+        .data_in_num = 12   // Serial Data (DOUT, lila cable,   works: 12)
     };
 
     err = i2s_driver_install(I2S_PORT, &i2s_config, 16, &pI2S_Queue_);
@@ -89,6 +107,38 @@ void setup() {
         Serial.printf("Failed setting pin: %d\n", err);
         while (true);
     }
+
+    // CSV stuff
+    if(csv_file_output_active) {
+        SPI.begin(14, 2, 15);
+        if(!SD.begin(13)){
+            Serial.println("Failed to mount card");
+            csv_file_output_active = false;         // deactivate feature 
+        }
+        csv_file = SD.open("/rta.csv", FILE_APPEND);
+        if(csv_file) {
+            // write headers
+            csv_file.print("\n\n\n");
+            for(int i = 0; i < fft_frequency_bin_count; i++) {
+                csv_file.printf("%i;", fft_frequency_bins[i]);
+            }
+            csv_file.print("\n");
+            csv_file.close();
+            
+            oledDisplay.setCursor(0, 8);
+            oledDisplay.println("append rta.csv.");
+            oledDisplay.display();
+        } else {
+            Serial.println("Failed to open CSV file");
+            csv_file_output_active = false;         // deactivate feature 
+        }
+    }
+    if(!csv_file_output_active) {
+        oledDisplay.setCursor(0, 8);
+        oledDisplay.println("no file output.");
+        oledDisplay.display();
+    }
+    
 
     // Multicore stuff
     TaskHandle_t Task1;
@@ -115,8 +165,6 @@ void setup() {
         1               // core #
     );
     delay(500);
-
-    start_time = millis();
 }
 
 
@@ -173,7 +221,10 @@ void read_i2s(void * pvParameters) {
     unsigned long time;
 
     while(true) {
-        err = i2s_read(I2S_PORT, &samples, i2s_read_size, &bytes_read, portMAX_DELAY);
+        i2s_read_done = false;
+
+        err = i2s_read(I2S_PORT, &samples, i2s_read_size, &bytes_read, portMAX_DELAY);      // this alone takes 10,578 - 11,567ms   (avg 11,078ms, over 380 iterations)
+        
         if(bytes_read != i2s_read_size) {
             Serial.printf("read incorrect amount of samples: Expected to read %i, but was %i.\n", i2s_read_size, bytes_read);
             while(true);
@@ -189,16 +240,13 @@ void read_i2s(void * pvParameters) {
 
         vTaskDelay(1);
 
-        Serial.print("read took ");
+        /*Serial.print("read took ");
         Serial.print(micros() - time);
         Serial.println("µs");
-        time = micros();
+        time = micros();*/
     }
 }
 
-const int fft_normalization_store_size = 20;
-double fft_normalization_max_values[fft_normalization_store_size] = {};
-int fft_normalization_max_value_index = 0;
 
 double* get_binned_values(double fft_data[], double *result) {
     double max_value = 0, min_value = __INT_MAX__;
@@ -221,54 +269,72 @@ double* get_binned_values(double fft_data[], double *result) {
         }
     }
 
-    // store current max value
-    fft_normalization_max_values[fft_normalization_max_value_index] = max_value;
-
-    
-
-    // calculate average max value
     double avg_max_value = 0;
-    for(int i = 0; i < fft_normalization_max_value_index; i++) {
-        avg_max_value += fft_normalization_max_values[i];
-    }
-    avg_max_value /= fft_normalization_store_size;
+    if(rta_gain_adaptation == RTA_ADAPTIVE_AVG_GAIN) {
+        // store current max value
+        rta_normalization_max_values[rta_normalization_max_value_index] = max_value;
 
-    fft_normalization_max_value_index++;
-    if(fft_normalization_max_value_index >= fft_normalization_store_size) {
-        fft_normalization_max_value_index = 0;
-    }
+        // calculate average max value
+        for(int i = 0; i < rta_normalization_store_size; i++) {
+            int index = i + rta_normalization_max_value_index;
+            if(index > rta_normalization_store_size) {
+                index -= rta_normalization_store_size;
+            }
+            avg_max_value += rta_normalization_max_values[index];
+        }
+        avg_max_value /= rta_normalization_store_size;
 
-    // debug: print fft data
-    /*Serial.print("fft data: ");
-    for(int i = 0; i < 10; i++) {
-        Serial.print(fft_data[i]);
-        Serial.print(", ");
+        rta_normalization_max_value_index++;
+        if(rta_normalization_max_value_index >= rta_normalization_store_size) {
+            rta_normalization_max_value_index = 0;
+        }
     }
-    Serial.println();*/
 
     // normalize data
-    //Serial.println("binned values:");
     max_value -= min_value;
     for(int result_index = 0; result_index < fft_frequency_bin_count; result_index++) {
-        result[result_index] = (result[result_index] - min_value) / max_value;
+        switch (rta_gain_adaptation) {
+            case RTA_CONSTANT_GAIN:
+                result[result_index] = (result[result_index] - min_value) / rta_constant_gain_value;
+                break;
+            case RTA_ADAPTIVE_GAIN:
+                result[result_index] = (result[result_index] - min_value) / max_value;
+                break;
+            default:
+            case RTA_ADAPTIVE_AVG_GAIN:
+                result[result_index] = (result[result_index] - min_value) / avg_max_value;
+                break;
+        }
         if(result[result_index] > 1.0) {
             result[result_index] = 1.0;
         }
-        // debug: print result
-        //Serial.print(result[result_index], 16);
-        //Serial.print(", ");
     }
-    //Serial.println();
 
     return result;
+}
+
+
+void print_samples(int32_t *s0, int32_t *s1) {
+    Serial.println("0: ");
+    for(int i = 0; i < sample_count; i++) {
+        Serial.print(s0[i]);
+        Serial.print(", ");
+    }
+    Serial.println("\n1: ");
+    for(int i = 0; i < sample_count; i++) {
+        Serial.print(s1[i]);
+        Serial.print(", ");
+    }
+    Serial.println();
 }
 
 // analzye takes 15900µs = 15,9ms
 // without FFT Hamming-windowing: 12,2ms
 // with RTA display: 30ms
+// with RTA, without FFT Hamming-windowing: 26,98ms
 void analyze_data(void * pvParameters) {
 
-    // OLED stuff
+    // OLED stuff, have to do this again in order for the display to print the correct result
     if(!oledDisplay.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS)) {
         Serial.println("error initializing SSD1306 display.");
         while(true);
@@ -281,10 +347,23 @@ void analyze_data(void * pvParameters) {
     oledDisplay.display();
 
     unsigned long time_end = 0;
+    
+    if(csv_file_output_active) {
+        csv_file = SD.open("/rta.csv", FILE_APPEND);
+        if(csv_file) {
+            Serial.println("opened rta.csv for analyzing");
+        } else {
+            Serial.println("Failed to open CSV file");
+            csv_file_output_active = false;         // deactivate feature 
+        }
+    }
+
+    int loop_counter = 0;
 
     while(true) {
         // wait until reading is done
         while(!i2s_read_done) {
+            vTaskDelay(1);
         }
 
         // debug: print fft input array
@@ -295,12 +374,11 @@ void analyze_data(void * pvParameters) {
         Serial.println();*/
 
         // fill fft_imag array and convert input array from int32_t to double_t
+        // this loop takes 122µs = 0,122ms = 0,00122 s
         for(int i = 0; i < sample_count; i++) {
             fft_imag[i] = 0;
             fft_real[i] = (double) samples[i];
         }
-
-        i2s_read_done = false;
 
         FFT.Windowing(FFT_WIN_TYP_HAMMING, FFT_FORWARD);
         FFT.Compute(FFT_FORWARD);
@@ -337,28 +415,45 @@ void analyze_data(void * pvParameters) {
 
         oledDisplay.clearDisplay();
         oledDisplay.setCursor(0, 0);
+
         double binned_data[fft_frequency_bin_count] = {};
         get_binned_values(fft_real, binned_data);
-        const float rta_max_bar_height = 32.0;
         for(int i = 0; i < fft_frequency_bin_count; i++) {
             int x_offset = i * 8;
-            double height_d = std::floor((binned_data[i] * rta_max_bar_height) + 0.5);
-            int height = height_d;
+            int height = std::floor((binned_data[i] * rta_max_bar_height) + 0.5);
             int y_offset = rta_max_bar_height - height;
             for(int x = 0; x < 8; x++) {
                 oledDisplay.drawFastVLine(x_offset + x, y_offset, 32, WHITE);
             }
+            if(csv_file_output_active) {
+                csv_file.printf("%f;", binned_data[i]);
+            }
         }
         oledDisplay.display();
 
+        if(csv_file_output_active) {
+            csv_file.print("\n");
+            loop_counter++;
+            if(loop_counter == 100) {
+                csv_file.close();
+                csv_file = SD.open("/rta.csv", FILE_APPEND);
+                if(csv_file) {
+                    Serial.println("reopened rta.csv for analyzing");
+                } else {
+                    Serial.println("Failed to open CSV file");
+                    csv_file_output_active = false;         // deactivate feature 
+                }
+                loop_counter = 0;                           // prevent overflow
+            }
+        }
+
         vTaskDelay(1);
 
-        Serial.print("analyze took ");
+        /*Serial.print("analyze took ");
         Serial.print(micros() - time_end);
         Serial.println("µs");
 
-        time_end = micros();
-
+        time_end = micros();*/
     }
 }
 
@@ -376,14 +471,32 @@ void loop() {
 
 /*
 TODO: 
+    - CSV-Output automatisch an/aus schalten, wenn SD-Karte eingelegt bzw. nicht eingelegt ist
+    
+( eventuell:
     - queue hinzufügen -> queue geht nicht, weil FFT nicht unterschiedlich viele Elemente erwarten kann
-    --> Ringpuffer hinzufügen, feste Größe z.b. 4
+    --> Ringpuffer hinzufügen, feste Größe z.b. 4       (aktuell wird nur jedes 2. bis 3. gelesene sample analysiert)
         - i2s_read() pusht gelesene samples in puffer
         - analyze() popt alle verfügbaren (4) samples aus queue und berechnet FFT
             - FFT auf 4 * samples_count anpassen (vorher angucken, ob 4 auf einander folgende sample-arrays aneinander passen)
             - eventuell Semaphore, dass analyze() immer exakt nach 4 neuen sample-Arrays ausgeführt wird
+)
+
+
+DONE: 
     - Normalisierung des RTA über gespeicherten durchschnitts-max-value
         - max-value nutzen, evtl. Anzahl der gespeicherten max-Values noch erhöhen (20 -> 200 ?)
     - RTA-multiplier anpassen
 
+WON'T DO:
+    - eventuell Durchschnitt statt Maximum der einzelnen FFT-Bins für RTA-bin-Auswertung nehmen 
+        (Maximum ist schon gut so)
+    - eventuell RTA-Frequenz-Bins anpassen:
+        - weniger bins < 200Hz
+        - mehr bins 250Hz - 2k Hz
+        - weniger > 10k Hz
+        (nicht mehr unbedingt notwendig seit angepassten RTA-Multiplier)
+
+OBSOLET:
+    - herausfinden, warum Display manchmal für ca 0,25s schwarz ist
 */
