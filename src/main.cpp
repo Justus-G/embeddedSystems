@@ -53,6 +53,7 @@ const String csv_file_name = "rta.csv";     // CSV file to use
 void read_i2s(void * pvParameters);         // i2s read method
 void analyze_data(void * pvParameters);     // FFT analyze method
 int32_t samples_write_lock = 0;             // parallelization semaphore lock
+int32_t samples_read_lock = -1;             // parallelization read lock
 
 // OLED Display stuff
 #define OLED_SDA 21                         // SDA pin
@@ -124,10 +125,10 @@ void setup() {
     };
 
     const i2s_pin_config_t pin_config = {
-        .bck_io_num = 23,   // Serial Clock (BCK, green cable,  works: 14)
-        .ws_io_num = 25,    // Word Select (LRCL, blue cable,   works: 13)
+        .bck_io_num = 23,   // Serial Clock (BCK on Mic)    green cable,  works: 14)
+        .ws_io_num = 25,    // Word Select (LRCL on Mic)    blue cable,   works: 13)
         .data_out_num = I2S_PIN_NO_CHANGE, // not used (only for speakers)
-        .data_in_num = 12   // Serial Data (DOUT, purple cable, works: 12)
+        .data_in_num = 12   // Serial Data (DOUT on Mic)    purple cable, works: 12)
     };
 
     err = i2s_driver_install(I2S_PORT, &i2s_config, i2s_event_queue_length, &i2s_event_queue);
@@ -171,13 +172,11 @@ void setup() {
     Serial.println("setup done");
 }
 
-
+// https://github.com/esikora/M5StickC_AudioVisLed/blob/main/src/M5StickC_AudiVisLedApp.cpp
 void check_i2s_speed() {
     i2s_event_t i2s_event;
     uint16_t rx_done_event_count = 0;
     uint16_t i2s_msg_count = uxQueueMessagesWaiting(i2s_event_queue);
-
-    log_v("Number of I2S events waiting in queue: %d", i2s_msg_count);
 
     // Iterate over all events in the i2s event queue
     for(int i = 0; i < i2s_msg_count; i++) {
@@ -203,7 +202,6 @@ void check_i2s_speed() {
 
     // If there are more RX done events in the queue than expected, probably data processing takes too long
     if(rx_done_event_count > (sample_count / i2s_buffer_size)) {
-        log_w("Frame loss. Number of I2S_EVENT_RX_DONE events is: %d", rx_done_event_count);
         Serial.printf("Frame loss. Number of I2S_EVENT_RX_DONE events is: %d\n", rx_done_event_count);
         if(rx_done_event_count == i2s_event_queue_length) {
             // only stop program if there is no chance of catching up
@@ -211,7 +209,6 @@ void check_i2s_speed() {
         }
     }
     if(rx_done_event_count < (sample_count / i2s_buffer_size)) {
-        log_e("Configuration error? Number of I2S_EVENT_RX_DONE events is: %d", rx_done_event_count);
         Serial.printf("Configuration error? Number of I2S_EVENT_RX_DONE events is: %d\n", rx_done_event_count);
         while(true);
     }
@@ -222,25 +219,36 @@ void read_i2s(void * pvParameters) {
     size_t bytes_read;
     esp_err_t err;
 
-    unsigned long time;
+    unsigned long time, time_before = 0, time_read = 0, time_check_err = 0, time_check_i2s = 0, time_delay = 0;
 
     while(true) {
-        
+        time_before = micros();
         switch(samples_write_lock) {
             case 0:
                 // write lock was on samples0 last time --> set to samples1 and start reading
+                while(samples_read_lock == 1) {
+                    // wait
+                    Serial.print("---------------- been waiting 1: ");
+                    Serial.println(millis());
+                }        
                 samples_write_lock = 1;
                 err = i2s_read(I2S_PORT, &samples1, i2s_read_size, &bytes_read, portMAX_DELAY);     // this alone takes 10,578 - 11,567ms   (avg 11,078ms, over 380 iterations)
                 break;
             case 1:
                 // write lock was on samples1 last time --> set to samples0 and start reading
+                while(samples_read_lock == 0) {
+                    // wait
+                    Serial.print("---------------- been waiting 0: ");
+                    Serial.println(millis());
+                }
                 samples_write_lock = 0;
                 err = i2s_read(I2S_PORT, &samples0, i2s_read_size, &bytes_read, portMAX_DELAY);      // this alone takes 10,578 - 11,567ms   (avg 11,078ms, over 380 iterations)
                 break;
         }
+        time_read = micros() - time_before;
 
         //err = i2s_read(I2S_PORT, &samples, i2s_read_size, &bytes_read, portMAX_DELAY);      // this alone takes 10,578 - 11,567ms   (avg 11,078ms, over 380 iterations)
-        
+        time_before = micros();
         if(bytes_read != i2s_read_size) {
             Serial.printf("read incorrect amount of samples: Expected to read %i, but was %i.\n", i2s_read_size, bytes_read);
             while(true);
@@ -249,14 +257,32 @@ void read_i2s(void * pvParameters) {
             Serial.println("error while reading I2S.");
             while(true);
         }
+        time_check_err = micros() - time_before;
 
+        time_before = micros();
         check_i2s_speed();
+        time_check_i2s = micros() - time_before;
 
+        time_before = micros();
         vTaskDelay(1);
+        time_delay = micros() - time_before;
 
-        Serial.print("read took ");
+        /*Serial.print("read took ");
         Serial.print(micros() - time);
-        Serial.println("µs");
+
+        Serial.print(" read I2S: ");
+        Serial.print(time_read);
+
+        Serial.print(" check err: ");
+        Serial.print(time_check_err);
+
+        Serial.print(" check I2S: ");
+        Serial.print(time_check_i2s);
+
+        Serial.print(" delay: ");
+        Serial.print(time_delay);
+
+        Serial.println();*/
         time = micros();
     }
 }
@@ -346,7 +372,7 @@ void analyze_data(void * pvParameters) {
     oledDisplay.println("analyzing...");
     oledDisplay.display();
 
-    unsigned long time_end = 0;
+    unsigned long time_end = 0, time_before = 0, windowing_time = 0, fft_time = 0, magnitude_time = 0;
     
     if(csv_file_output_active) {
         csv_file = SD.open("/" + csv_file_name, FILE_APPEND);
@@ -373,6 +399,7 @@ void analyze_data(void * pvParameters) {
         switch(samples_write_lock) {
             case 0:
                 // write lock is on samples0 --> read samples1
+                samples_read_lock = 1;
                 for(int i = 0; i < sample_count; i++) {
                     fft_imag[i] = 0;
                     fft_real[i] = (double) samples1[i];
@@ -380,16 +407,26 @@ void analyze_data(void * pvParameters) {
                 break;
             case 1:
                 // write lock is on samples1 --> read samples0
+                samples_read_lock = 0;
                 for(int i = 0; i < sample_count; i++) {
                     fft_imag[i] = 0;
                     fft_real[i] = (double) samples0[i];
                 }
                 break;
         }
+        samples_read_lock = -1;
 
+        time_before = micros();
         FFT.Windowing(FFT_WIN_TYP_HAMMING, FFT_FORWARD);
+        windowing_time = micros() - time_before;
+
+        time_before = micros();
         FFT.Compute(FFT_FORWARD);
+        fft_time = micros() - time_before;
+
+        time_before = micros();
         FFT.ComplexToMagnitude();
+        magnitude_time = micros() - time_before;
 
         // debug: print fft output array
         /*Serial.println("FFT:");
@@ -420,16 +457,21 @@ void analyze_data(void * pvParameters) {
         oledDisplay.println("");
         oledDisplay.display();*/
 
+        time_before = micros();
         oledDisplay.clearDisplay();
         oledDisplay.setCursor(0, 0);
 
         double binned_data[fft_frequency_bin_count] = {};
         calc_rta_bins(fft_real, binned_data);
+        unsigned long bin_time = micros() - time_before;
+
+        time_before = micros();
         for(int i = 0; i < fft_frequency_bin_count; i++) {
             int x_offset = i * 8;
             int height = std::floor((binned_data[i] * rta_max_bar_height) + 0.5);
             int y_offset = rta_max_bar_height - height;
-            for(int x = 0; x < 8; x++) {
+            // oledDisplay.drawRect(x_offset, y_offset, 8, height, WHITE);      with this line, drawing takes approx. 13,35ms (non-filled rectangles)
+            for(int x = 0; x < 8; x++) {  //    with this loop, drawing takes approx. 13,37ms (filled rectangles)
                 oledDisplay.drawFastVLine(x_offset + x, y_offset, 32, WHITE);
             }
             if(csv_file_output_active) {
@@ -437,7 +479,9 @@ void analyze_data(void * pvParameters) {
             }
         }
         oledDisplay.display();
+        unsigned long draw_time = micros() - time_before;
 
+        time_before = micros();
         if(csv_file_output_active) {
             csv_file.print("\n");
             loop_counter++;
@@ -454,12 +498,31 @@ void analyze_data(void * pvParameters) {
                 loop_counter = 0;                           // prevent overflow
             }
         }
+        unsigned long csv_time = micros() - time_before;
 
         vTaskDelay(1);
 
         Serial.print("analyze took ");
         Serial.print(micros() - time_end);
-        Serial.println("µs");
+        
+        Serial.print(" windowing: ");
+        Serial.print(windowing_time);
+
+        Serial.print(" FFT: ");
+        Serial.print(fft_time);
+
+        Serial.print(" magnitudes: ");
+        Serial.print(magnitude_time);
+
+        Serial.print(" bin: ");
+        Serial.print(bin_time);
+
+        Serial.print(" draw: ");
+        Serial.print(draw_time);
+
+        Serial.print(" csv: ");
+        Serial.print(csv_time);
+        Serial.println();
 
         time_end = micros();
     }
