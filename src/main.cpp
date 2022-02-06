@@ -267,7 +267,7 @@ void read_i2s(void * pvParameters) {
         vTaskDelay(1);
         time_delay = micros() - time_before;
 
-        /*Serial.print("read took ");
+        Serial.print("read took ");
         Serial.print(micros() - time);
 
         Serial.print(" read I2S: ");
@@ -282,7 +282,7 @@ void read_i2s(void * pvParameters) {
         Serial.print(" delay: ");
         Serial.print(time_delay);
 
-        Serial.println();*/
+        Serial.println();
         time = micros();
     }
 }
