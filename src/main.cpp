@@ -5,7 +5,6 @@
 #include <Adafruit_I2CDevice.h>
 #include <Adafruit_SSD1306.h>
 #include <driver/i2s.h>
-#include "driver/i2s.h"
 #include <arduinoFFT.h>
 #include "FS.h"
 #include "SD.h"
@@ -53,10 +52,9 @@ const String csv_file_name = "rta.csv";     // CSV file to use
 void read_i2s(void * pvParameters);         // i2s read method
 void analyze_data(void * pvParameters);     // FFT analyze method
 int32_t samples_write_lock = 0;             // parallelization semaphore lock
+int32_t samples_read_lock = -1;             // parallelization read lock
 
 // OLED Display stuff
-#define OLED_SDA 21                         // SDA pin
-#define OLED_SCL 22                         // SCL pin
 #define SCREEN_WIDTH 128                    // OLED display width, in pixels
 #define SCREEN_HEIGHT 32                    // OLED display height, in pixels
 #define SCREEN_ADDRESS 0x3C                 // 0x3D for 128x64, 0x3C for 128x32
@@ -124,10 +122,10 @@ void setup() {
     };
 
     const i2s_pin_config_t pin_config = {
-        .bck_io_num = 23,   // Serial Clock (BCK, green cable,  works: 14)
-        .ws_io_num = 25,    // Word Select (LRCL, blue cable,   works: 13)
+        .bck_io_num = 23,   // Serial Clock (BCK on Mic)    green cable,  works: 14)
+        .ws_io_num = 25,    // Word Select (LRCL on Mic)    blue cable,   works: 13)
         .data_out_num = I2S_PIN_NO_CHANGE, // not used (only for speakers)
-        .data_in_num = 12   // Serial Data (DOUT, purple cable, works: 12)
+        .data_in_num = 12   // Serial Data (DOUT on Mic)    purple cable, works: 12)
     };
 
     err = i2s_driver_install(I2S_PORT, &i2s_config, i2s_event_queue_length, &i2s_event_queue);
@@ -166,53 +164,32 @@ void setup() {
         &Task2,         // task handle
         1               // core #
     );
-    delay(500);
 
     Serial.println("setup done");
 }
 
-
+// idea from https://github.com/esikora/M5StickC_AudioVisLed/blob/main/src/M5StickC_AudiVisLedApp.cpp
 void check_i2s_speed() {
     i2s_event_t i2s_event;
     uint16_t rx_done_event_count = 0;
-    uint16_t i2s_msg_count = uxQueueMessagesWaiting(i2s_event_queue);
-
-    log_v("Number of I2S events waiting in queue: %d", i2s_msg_count);
-
-    // Iterate over all events in the i2s event queue
-    for(int i = 0; i < i2s_msg_count; i++) {
-        // Take next event from queue
+    
+    for(int i = 0; i < uxQueueMessagesWaiting(i2s_event_queue); i++) {
         if(xQueueReceive(i2s_event_queue, (void*) &i2s_event, 0) == pdTRUE) {
-            switch (i2s_event.type){
-                case I2S_EVENT_DMA_ERROR:
-                    log_e("I2S_EVENT_DMA_ERROR");
-                    break;
-                case I2S_EVENT_TX_DONE:
-                    log_v("I2S_EVENT_TX_DONE");
-                    break;
-                case I2S_EVENT_RX_DONE:
-                    log_v("I2S_EVENT_RX_DONE");
-                    rx_done_event_count++;
-                    break;
-                case I2S_EVENT_MAX:
-                    log_w("I2S_EVENT_MAX");
-                    break;
+            if(i2s_event.type == I2S_EVENT_RX_DONE) {
+                rx_done_event_count++;
             }
         }
     }
 
-    // If there are more RX done events in the queue than expected, probably data processing takes too long
     if(rx_done_event_count > (sample_count / i2s_buffer_size)) {
-        log_w("Frame loss. Number of I2S_EVENT_RX_DONE events is: %d", rx_done_event_count);
-        Serial.printf("Frame loss. Number of I2S_EVENT_RX_DONE events is: %d\n", rx_done_event_count);
+        Serial.printf("too many I2S RX DONE events in queue: %d\n", rx_done_event_count);
         if(rx_done_event_count == i2s_event_queue_length) {
             // only stop program if there is no chance of catching up
             while(true);
         }
     }
     if(rx_done_event_count < (sample_count / i2s_buffer_size)) {
-        log_e("Configuration error? Number of I2S_EVENT_RX_DONE events is: %d", rx_done_event_count);
-        Serial.printf("Configuration error? Number of I2S_EVENT_RX_DONE events is: %d\n", rx_done_event_count);
+        Serial.printf("not enough I2S RX DONE events in queue: %d\n", rx_done_event_count);
         while(true);
     }
 }
@@ -222,24 +199,27 @@ void read_i2s(void * pvParameters) {
     size_t bytes_read;
     esp_err_t err;
 
-    unsigned long time;
+    //unsigned int time = 0;
 
     while(true) {
-        
         switch(samples_write_lock) {
             case 0:
                 // write lock was on samples0 last time --> set to samples1 and start reading
+                while(samples_read_lock == 1) {
+                    // wait, does basically never happen
+                }        
                 samples_write_lock = 1;
                 err = i2s_read(I2S_PORT, &samples1, i2s_read_size, &bytes_read, portMAX_DELAY);     // this alone takes 10,578 - 11,567ms   (avg 11,078ms, over 380 iterations)
                 break;
             case 1:
                 // write lock was on samples1 last time --> set to samples0 and start reading
+                while(samples_read_lock == 0) {
+                    // wait, does basically never happen
+                }
                 samples_write_lock = 0;
                 err = i2s_read(I2S_PORT, &samples0, i2s_read_size, &bytes_read, portMAX_DELAY);      // this alone takes 10,578 - 11,567ms   (avg 11,078ms, over 380 iterations)
                 break;
         }
-
-        //err = i2s_read(I2S_PORT, &samples, i2s_read_size, &bytes_read, portMAX_DELAY);      // this alone takes 10,578 - 11,567ms   (avg 11,078ms, over 380 iterations)
         
         if(bytes_read != i2s_read_size) {
             Serial.printf("read incorrect amount of samples: Expected to read %i, but was %i.\n", i2s_read_size, bytes_read);
@@ -254,10 +234,10 @@ void read_i2s(void * pvParameters) {
 
         vTaskDelay(1);
 
-        Serial.print("read took ");
+        /*Serial.print("read took ");
         Serial.print(micros() - time);
         Serial.println("µs");
-        time = micros();
+        time = micros();*/
     }
 }
 
@@ -340,13 +320,11 @@ void analyze_data(void * pvParameters) {
         while(true);
     }
     oledDisplay.clearDisplay();
-    oledDisplay.setTextSize(1);         // small font size (height 8px)
+    oledDisplay.setTextSize(1);
     oledDisplay.setTextColor(WHITE);
     oledDisplay.setCursor(0, 0);
     oledDisplay.println("analyzing...");
     oledDisplay.display();
-
-    unsigned long time_end = 0;
     
     if(csv_file_output_active) {
         csv_file = SD.open("/" + csv_file_name, FILE_APPEND);
@@ -358,21 +336,16 @@ void analyze_data(void * pvParameters) {
         }
     }
 
-    int loop_counter = 0;
+    unsigned int loop_counter = 0;
+    //unsigned int time_end = 0;
 
     while(true) {
-        // debug: print fft input array
-        /*for(int i = 0; i < sample_count; i++) {
-            Serial.print(samples[i]);
-            Serial.print(", ");
-        }
-        Serial.println();*/
-
         // fill fft_imag array and convert input array from int32_t to double_t
         // this loop takes 122µs = 0,122ms = 0,00122 s
         switch(samples_write_lock) {
             case 0:
                 // write lock is on samples0 --> read samples1
+                samples_read_lock = 1;
                 for(int i = 0; i < sample_count; i++) {
                     fft_imag[i] = 0;
                     fft_real[i] = (double) samples1[i];
@@ -380,45 +353,18 @@ void analyze_data(void * pvParameters) {
                 break;
             case 1:
                 // write lock is on samples1 --> read samples0
+                samples_read_lock = 0;
                 for(int i = 0; i < sample_count; i++) {
                     fft_imag[i] = 0;
                     fft_real[i] = (double) samples0[i];
                 }
                 break;
         }
+        samples_read_lock = -1;
 
         FFT.Windowing(FFT_WIN_TYP_HAMMING, FFT_FORWARD);
         FFT.Compute(FFT_FORWARD);
         FFT.ComplexToMagnitude();
-
-        // debug: print fft output array
-        /*Serial.println("FFT:");
-        for(int i = 0; i < sample_count; i++) {
-            Serial.print(fft_real[i]);
-            Serial.print(", ");
-        }
-        Serial.println();*/
-
-        /*int freq = FFT.MajorPeakParabola();
-
-        char c[15];
-        String s = "";
-        if(freq < 1000) {
-            sprintf(c, "  %i", freq);
-        } else if(freq < 10000) {
-            sprintf(c, " %i", freq);
-        } else {
-            sprintf(c, "%i", freq);
-        }
-        s = s + c;
-
-        oledDisplay.clearDisplay();
-        oledDisplay.setCursor(0, 0);
-        oledDisplay.printf("f: %s Hz\n", s);
-        oledDisplay.print("analyze ");
-        oledDisplay.print(micros() - time_end);
-        oledDisplay.println("");
-        oledDisplay.display();*/
 
         oledDisplay.clearDisplay();
         oledDisplay.setCursor(0, 0);
@@ -429,7 +375,8 @@ void analyze_data(void * pvParameters) {
             int x_offset = i * 8;
             int height = std::floor((binned_data[i] * rta_max_bar_height) + 0.5);
             int y_offset = rta_max_bar_height - height;
-            for(int x = 0; x < 8; x++) {
+            // oledDisplay.drawRect(x_offset, y_offset, 8, height, WHITE);      with this line, drawing takes approx. 13,35ms (non-filled rectangles)
+            for(int x = 0; x < 8; x++) {  //    with this loop, drawing takes approx. 13,37ms (filled rectangles)
                 oledDisplay.drawFastVLine(x_offset + x, y_offset, 32, WHITE);
             }
             if(csv_file_output_active) {
@@ -440,35 +387,24 @@ void analyze_data(void * pvParameters) {
 
         if(csv_file_output_active) {
             csv_file.print("\n");
+            
             loop_counter++;
-            // close and re-open csv file every 100 iterations to force a buffer dump
+            // flush csv file every 100 iterations (takes approx. 20ms)
             if(loop_counter == 100) {
-                csv_file.close();
-                csv_file = SD.open("/" + csv_file_name, FILE_APPEND);
-                if(csv_file) {
-                    Serial.println("reopened " + csv_file_name + " for analyzing");
-                } else {
-                    Serial.println("Failed to open CSV file " + csv_file_name);
-                    csv_file_output_active = false;         // deactivate feature 
-                }
-                loop_counter = 0;                           // prevent overflow
+                csv_file.flush();
+                loop_counter = 0; // prevent overflow
             }
         }
 
         vTaskDelay(1);
 
-        Serial.print("analyze took ");
+        /*Serial.print("analyze took ");
         Serial.print(micros() - time_end);
         Serial.println("µs");
 
-        time_end = micros();
+        time_end = micros();*/
     }
 }
-
-
-
-
-
 
 
 
@@ -478,19 +414,7 @@ void loop() {
 
 
 /*
-TODO: 
-    
-( eventuell:
-    - queue hinzufügen -> queue geht nicht, weil FFT nicht unterschiedlich viele Elemente erwarten kann
-    --> Ringpuffer hinzufügen, feste Größe z.b. 4       (aktuell wird nur jedes 2. bis 3. gelesene sample analysiert)
-        - i2s_read() pusht gelesene samples in puffer
-        - analyze() popt alle verfügbaren (4) samples aus queue und berechnet FFT
-            - FFT auf 4 * samples_count anpassen (vorher angucken, ob 4 auf einander folgende sample-arrays aneinander passen)
-            - eventuell Semaphore, dass analyze() immer exakt nach 4 neuen sample-Arrays ausgeführt wird
-)
-
-
-DONE: 
+DONE:
     - CSV-Output automatisch an/aus schalten, wenn SD-Karte eingelegt bzw. nicht eingelegt ist
     - Normalisierung des RTA über gespeicherten durchschnitts-max-value
         - max-value nutzen, evtl. Anzahl der gespeicherten max-Values noch erhöhen (20 -> 200 ?)
@@ -504,6 +428,14 @@ WON'T DO:
         - mehr bins 250Hz - 2k Hz
         - weniger > 10k Hz
         (nicht mehr unbedingt notwendig seit angepassten RTA-Multiplier)
+( eventuell:
+    - queue hinzufügen -> queue geht nicht, weil FFT nicht unterschiedlich viele Elemente erwarten kann
+    --> Ringpuffer hinzufügen, feste Größe z.b. 4       (aktuell wird nur jedes 2. bis 3. gelesene sample analysiert)
+        - i2s_read() pusht gelesene samples in puffer
+        - analyze() popt alle verfügbaren (4) samples aus queue und berechnet FFT
+            - FFT auf 4 * samples_count anpassen (vorher angucken, ob 4 auf einander folgende sample-arrays aneinander passen)
+            - eventuell Semaphore, dass analyze() immer exakt nach 4 neuen sample-Arrays ausgeführt wird
+)
 
 OBSOLET:
     - herausfinden, warum Display manchmal für ca 0,25s schwarz ist
